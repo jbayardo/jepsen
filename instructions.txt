@@ -1,0 +1,35 @@
+clone the JVM client, run
+ mvn clean install
+
+All of these instructions assume that your working directory is jepsen/docker/.
+
+-------------------------------
+
+In terminal 0:
+
+sudo JEPSEN_ROOT="/home/user/jepsen" ./up.sh --dev
+
+-------------------------------
+
+In terminal 1:
+
+sudo docker inspect jepsen-control | grep IPAddress
+
+This will fetch the IP address of the jepsen-control host. Take note of it.
+
+sudo docker exec -it jepsen-control bash
+lein run serve
+
+This sets up a web server so that you can look into the debug logs easily. Open your browser, and point it to the IP address we got from before at port 8080.
+
+If you prefer to look into the log files manually, they are located in the .
+
+-------------------------------
+
+In terminal 2:
+
+sudo docker exec -it jepsen-control bash
+cd ravendb
+lein run test
+
+This effectively runs the test and creates the execution reports, which you can look at from the web server.
