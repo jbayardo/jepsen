@@ -3,68 +3,35 @@
   (:require [clojure.tools.logging :refer :all]
             [clojure.string :as str]
             [jepsen [cli :as cli]
-             [control :as c]
+             [client :as client]
+             [control :as ctrl]
              [db :as db]
-             [tests :as tests]]
+             [generator :as gen]
+             [tests :as tests]
+             [util :as util]
+             [core :as jepsen]]
             [jepsen.control.util :as cu]
             [jepsen.os.debian :as debian]
-            [jepsen.core :as jepsen]))
+            [jepsen.ravendb.defaults :refer :all]))
 
-;; See https://stackoverflow.com/questions/21098784/is-there-an-idiomatic-way-to-avoid-long-clojure-string-literals
-(defmacro compile-time-slurp
-  "Read a file into Clojure in compile time. Used to avoid long strings in code."
-  [file]
-  (slurp file))
+(defn client
+  "A client for a single compare-and-set register"
+  []
+  (reify client/Client
+    (setup! [_ test node] (client))
 
-(def install-path "/opt/ravendb")
+    (invoke! [this test op]
+      (case (:f op)
+        :read (assoc op :type :ok, :value nil)))
 
-(def executable-path "Server/Raven.Server")
-
-(def logfile (str install-path "/jepsen.log"))
-
-(def pidfile (str install-path "/jepsen.pid"))
-
-(def license
-  (->> (compile-time-slurp "license.json")
-       (#(str/replace % #"\r?\n" ""))
-       (#(str/replace % #"\s+" " "))
-       ))
-
-(def assigned-cores-per-node 2)
-
-(def studio-port 8888)
-
-(def client-port 38888)
-
-(defn download-url
-  "Generate the URL to download RavenDB from"
-  [version]
-  (str "http://hibernatingrhinos.com/downloads/RavenDB%20for%20Ubuntu%2016.04%20x64/" version))
-
-(defn into-url
-  [protocol address port]
-  (str protocol "://" address ":" port))
-
-(defn server-url
-  [node]
-  (into-url "http" "0.0.0.0" studio-port))
-
-(defn server-url-tcp
-  [node]
-  (into-url "tcp" "0.0.0.0" client-port))
-
-(defn public-server-url
-  [node]
-  (into-url "http" (name node) studio-port))
-
-(defn public-server-url-tcp
-  [node]
-  (into-url "tcp" (name node) client-port))
+    (teardown! [_ test])
+    ))
 
 (defn install-server!
+  "Downloads and installs the server executable for some version into a given node"
   [node version]
   (info node "installing RavenDB" version)
-  (c/su
+  (ctrl/su
     ;; Install required packages
     (debian/install {:libunwind8      "*",
                      :ca-certificates "*",
@@ -72,83 +39,54 @@
                      ;; We install -dev here because libicu55/57 can't be found
                      :libicu-dev      "*",})
     ;; Download and extract the tarball into the install path
-    (cu/install-tarball! c/*host* (download-url version) install-path)))
-
-(defn format-raven-arguments
-  [arguments]
-  (map
-    (fn [[real-key value]]
-      (let [key (name real-key)
-            kv-pair (if (str/blank? value) key (str key "=" value))]
-        (str "--" kv-pair))) arguments))
-
-(defn raven-arguments
-  [node]
-  (format-raven-arguments
-    {
-     :ServerUrl                       (server-url node),
-     :ServerUrl.Tcp                   (server-url-tcp node),
-     :PublicServerUrl                 (public-server-url node),
-     :PublicServerUrl.Tcp             (public-server-url-tcp node),
-     :Security.UnsecuredAccessAllowed "PublicNetwork",
-     :log-to-console                  "",
-     }))
+    (cu/install-tarball! ctrl/*host* (download-url version) install-path)))
 
 (defn start-server!
   [node]
-  (info node "starting RavenDB server")
-  (c/su
-    (apply (cu/start-daemon!
-             {:logfile logfile
-              :pidfile pidfile
-              :chdir   install-path}
-             executable-path)
-           raven-arguments)
+  (ctrl/su
+    (apply (partial cu/start-daemon!
+                    {:logfile log-file-path
+                     :pidfile pid-file-path
+                     :chdir   install-path}
+                    executable-path)
+           (executable-arguments node))
     ))
 
 (defn activate-license!
+  "Activates the license for a given node. This is required because cluster features are paid for"
   [node]
-  (c/exec :curl
-          :-L
-          :-X "POST"
-          :-d license
-          (str (public-server-url node) "/admin/license/activate")))
-
-(defn configure!
-  [node]
-  (activate-license! node))
+  (ctrl/exec :curl
+             :-L
+             :-X "POST"
+             :-H "Content-Type: application/json"
+             :-d license
+             (str (public-server-url node) "/admin/license/activate"))
+  (info node "License activated!"))
 
 (defn stop-server!
   [node]
-  (info node "stopping RavenDB server")
-  (c/su
-    (cu/stop-daemon! executable-path pidfile)))
+  (ctrl/su (cu/stop-daemon! executable-path pid-file-path)))
 
 (defn uninstall-server!
   [node]
-  (info node "uninstalling RavenDB")
-  (c/su
-    (c/exec :rm
-            :--force
-            :--recursive
-            install-path)))
+  (ctrl/su
+    (ctrl/exec :rm
+               :--force
+               :--recursive
+               install-path)))
 
 (defn link-to!
   [leader-node node]
+  (info leader-node (str "Linking against " node))
   (let [url (str (public-server-url leader-node) "/admin/cluster/node?url=" (public-server-url node) "&assignedCores=" assigned-cores-per-node)]
-    (c/exec :curl
-            :-L
-            :-X "PUT"
-            :-d ""
-            url)
-    ))
+    (ctrl/exec :curl
+               :-L
+               :-X "PUT"
+               :-d ""
+               url)))
 
-(defn link-cluster!
-  [test node]
-  (->> (:nodes test)
-       ;; Avoid linking against itself
-       (filter (partial not= node))
-       (map (partial link-to! node))))
+;/license/status
+
 
 (defn db
   "Set up a RavenDB instance with a particular version"
@@ -156,34 +94,57 @@
   (reify db/DB
     (setup! [_ test node]
       (info node "setting up RavenDB")
+      ;; Ensure there aren't any other instances running on this node
+      (ctrl/su (util/meh (ctrl/exec :killall
+                                    executable-name)))
+      ;; Download and install the server
       (install-server! node version)
+      ;; Start and give some grace time
       (start-server! node)
-      (Thread/sleep 5000)
-      (configure! node)
+      (Thread/sleep server-startup-grace-time-milliseconds)
+      ;; Set up licensing
+      (activate-license! node)
+      ;; Ensure they are all activated and running before proceeding
       (jepsen/synchronize test))
 
     (teardown! [_ test node]
       (info node "tearing down RavenDB")
       (stop-server! node)
-      (uninstall-server! node))
+      (uninstall-server! node)
+      (info node "RavenDB teardown succeeded"))
 
     db/Primary
     (setup-primary! [_ test node]
-      (link-cluster! test node))
+      (info node "RavenDB Primary setup running")
+      ; TODO: do this proper.
+      (link-to! "n1" "n2")
+      (link-to! "n1" "n3")
+      (link-to! "n1" "n4")
+      (link-to! "n1" "n5")
+      (info node "RavenDB primary setup finished"))
 
     db/LogFiles
     (log-files [_ test node]
-      [logfile])
+      [log-file-path])
     ))
+
+(defn r   [_ _] {:type :invoke, :f :read, :value nil})
+(defn w   [_ _] {:type :invoke, :f :write, :value (rand-int 5)})
+(defn cas [_ _] {:type :invoke, :f :cas, :value [(rand-int 5) (rand-int 5)]})
 
 (defn ravendb-test
   "Given an options map from the command-line runner (e.g. :nodes, :ssh,
   :concurrency, ...), constructs a test map."
   [opts]
   (merge tests/noop-test
-         {:name "ravendb"
-          :os   debian/os
-          :db   (db "40019-Rc")}
+         {:name   "ravendb"
+          :os     debian/os
+          :db     (db "40019-Rc")
+          :client (client)
+          :generator (->> r
+                          (gen/stagger 1)
+                          (gen/clients)
+                          (gen/time-limit 15))}
          opts))
 
 (defn -main
